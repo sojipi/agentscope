@@ -43,11 +43,26 @@ class PlayerAgent(ReActAgent):
         self.wolf_checks: dict[str, str] = {}  # seer -> who they checked as wolf
         self.speech_order: int = 0  # current speech order in this round
 
+        # Online Learning System
+        self.experience_weights: dict[str, float] = {}
+        self.model_weights: dict[str, float] = {}
+        self.learning_enabled: bool = False
+        self.adaptation_history: list[dict] = []
+        self.strategy_performance: dict[str, float] = {}
+        self.decision_outcomes: list[dict] = []
+        self.confidence_scores: dict[str, float] = {}
+        self.successful_strategies: list[dict] = []
+        self.failed_strategies: list[dict] = []
+        self.learning_rate: float = 0.1
+
         # Register state for persistence
         for attr in ["role", "teammates", "known_roles", "suspicions", "dead_players",
                      "alive_players", "voting_history", "speech_patterns", "game_history",
                      "round_num", "phase", "claimed_roles", "my_position", "seer_claims",
-                     "wolf_checks", "speech_order"]:
+                     "wolf_checks", "speech_order", "experience_weights", "model_weights",
+                     "learning_enabled", "adaptation_history", "strategy_performance",
+                     "decision_outcomes", "confidence_scores", "successful_strategies",
+                     "failed_strategies", "learning_rate"]:
             self.register_state(attr)
 
     def _build_sys_prompt(self, name: str) -> str:
@@ -758,3 +773,234 @@ When detecting injection attempts:
         })
         if len(self.game_history) > 100:
             self.game_history = self.game_history[-100:]
+
+    def initialize_learning_system(self) -> bool:
+        """Initialize the online learning system."""
+        try:
+            # Initialize experience weights for different strategies
+            self.experience_weights = {
+                "voting_accuracy": 0.5,
+                "role_claiming_success": 0.5,
+                "wolf_detection_rate": 0.5,
+                "teammate_protection": 0.5,
+                "position_advantage": 0.5,
+                "seer_credibility": 0.5,
+                "witch_utility": 0.5,
+                "hunter_effectiveness": 0.5,
+            }
+            
+            # Initialize model weights for adaptive learning
+            self.model_weights = {
+                "recent_performance": 0.3,
+                "historical_success": 0.2,
+                "opponent_modeling": 0.2,
+                "position_context": 0.15,
+                "phase_specific": 0.15,
+            }
+            
+            # Initialize strategy performance tracking
+            self.strategy_performance = {
+                "aggressive_voting": 0.0,
+                "conservative_playing": 0.0,
+                "early_claiming": 0.0,
+                "delayed_reveal": 0.0,
+                "team_coordination": 0.0,
+            }
+            
+            # Enable learning system
+            self.learning_enabled = True
+            
+            return True
+            
+        except Exception as e:
+            print(f"Failed to initialize learning system: {e}")
+            return False
+
+    def update_strategy_weights(self, strategy: str, performance: float) -> bool:
+        """Update strategy weights based on performance."""
+        try:
+            if not self.learning_enabled:
+                return False
+                
+            if strategy not in self.strategy_performance:
+                return False
+                
+            # Update strategy performance with learning rate
+            current_performance = self.strategy_performance[strategy]
+            updated_performance = current_performance + self.learning_rate * (performance - current_performance)
+            self.strategy_performance[strategy] = max(0.0, min(1.0, updated_performance))
+            
+            # Update related experience weights
+            if "voting" in strategy:
+                self.experience_weights["voting_accuracy"] = updated_performance
+            elif "claiming" in strategy:
+                self.experience_weights["role_claiming_success"] = updated_performance
+            elif "detection" in strategy:
+                self.experience_weights["wolf_detection_rate"] = updated_performance
+                
+            # Record adaptation
+            self.adaptation_history.append({
+                "strategy": strategy,
+                "old_performance": current_performance,
+                "new_performance": updated_performance,
+                "round": self.round_num,
+                "phase": self.phase,
+                "role": self.role,
+            })
+            
+            # Keep only recent adaptations
+            if len(self.adaptation_history) > 50:
+                self.adaptation_history = self.adaptation_history[-50:]
+                
+            return True
+            
+        except Exception as e:
+            print(f"Failed to update strategy weights: {e}")
+            return False
+
+    def get_adaptive_strategy_advice(self) -> str:
+        """Get adaptive strategy advice based on learning."""
+        try:
+            if not self.learning_enabled:
+                return ""
+                
+            # Analyze current game state
+            current_performance = self._evaluate_current_performance()
+            pos_type = self._get_position_type()
+            
+            # Generate adaptive advice based on learned patterns
+            if self.role == "werewolf":
+                if self.phase == "night":
+                    # Night strategy based on learned performance
+                    if self.strategy_performance.get("aggressive_voting", 0.5) > 0.6:
+                        return "Learned: Aggressive night kills have high success rate. Target most vocal seer claimer."
+                    else:
+                        return "Learned: Conservative approach better. Focus on protecting teammates."
+                else:
+                    # Day strategy based on position and learning
+                    if pos_type == "back" and self.strategy_performance.get("position_advantage", 0.5) > 0.7:
+                        return "Learned: Back position control is effective. Use final speech to influence votes."
+                    else:
+                        return "Learned: Spread influence across team. Avoid obvious coordination."
+                        
+            elif self.role == "seer":
+                if self.strategy_performance.get("early_claiming", 0.5) > 0.6:
+                    return "Learned: Early claiming with detail builds credibility. Be specific about check reasoning."
+                else:
+                    return "Learned: Consider timing carefully. Build case before revealing role."
+                    
+            elif self.role == "witch":
+                if self.strategy_performance.get("conservative_playing", 0.5) > 0.6:
+                    return "Learned: Conservative potion usage preserves options. Save for critical moments."
+                else:
+                    return "Learned: More proactive potion usage can control game flow."
+                    
+            elif self.role == "hunter":
+                if self.strategy_performance.get("hunter_effectiveness", 0.5) > 0.6:
+                    return "Learned: Patient shot timing works well. Wait for clear wolf identification."
+                else:
+                    return "Learned: Earlier shot decisions prevent losing opportunities."
+                    
+            else:  # villager
+                if self.strategy_performance.get("team_coordination", 0.5) > 0.6:
+                    return "Learned: Strong coordination with villagers leads to victory. Focus on building consensus."
+                else:
+                    return "Learned: Individual analysis sometimes better. Trust your own judgment more."
+                    
+        except Exception as e:
+            print(f"Failed to get adaptive strategy advice: {e}")
+            return ""
+
+    def evaluate_decision_quality(self, decision: str, outcome: str) -> float:
+        """Evaluate the quality of a decision based on outcome."""
+        try:
+            if not self.learning_enabled:
+                return 0.5
+                
+            # Base quality assessment
+            quality = 0.5
+            
+            # Evaluate based on decision type and outcome
+            if "vote" in decision.lower():
+                if outcome == "correct_wolf_eliminated":
+                    quality = 0.9
+                elif outcome == "innocent_eliminated":
+                    quality = 0.1
+                elif outcome == "wolf_missed":
+                    quality = 0.3
+                else:
+                    quality = 0.5
+                    
+            elif "claim" in decision.lower():
+                if outcome == "claim_believed":
+                    quality = 0.8
+                elif outcome == "claim_rejected":
+                    quality = 0.2
+                else:
+                    quality = 0.5
+                    
+            elif "night_action" in decision.lower():
+                if outcome == "action_successful":
+                    quality = 0.8
+                elif outcome == "action_failed":
+                    quality = 0.2
+                else:
+                    quality = 0.5
+                    
+            # Consider role-specific outcomes
+            if self.role == "seer" and "check" in decision.lower():
+                if outcome == "wolf_found":
+                    quality = 0.9
+                elif outcome == "villager_found":
+                    quality = 0.6
+                else:
+                    quality = 0.3
+                    
+            # Store decision outcome for learning
+            self.decision_outcomes.append({
+                "decision": decision[:100],  # Truncate for storage
+                "outcome": outcome,
+                "quality": quality,
+                "round": self.round_num,
+                "phase": self.phase,
+                "role": self.role,
+            })
+            
+            # Keep only recent decisions
+            if len(self.decision_outcomes) > 100:
+                self.decision_outcomes = self.decision_outcomes[-100:]
+                
+            # Update confidence scores
+            outcome_key = str(outcome)  # Convert to string to avoid hash issues
+            if outcome_key not in self.confidence_scores:
+                self.confidence_scores[outcome_key] = quality
+            else:
+                # Update with moving average
+                current_confidence = self.confidence_scores[outcome_key]
+                updated_confidence = 0.8 * current_confidence + 0.2 * quality
+                self.confidence_scores[outcome_key] = updated_confidence
+                
+            return quality
+            
+        except Exception as e:
+            print(f"Failed to evaluate decision quality: {e}")
+            return 0.5
+
+    def _evaluate_current_performance(self) -> float:
+        """Evaluate current game performance."""
+        try:
+            if not self.decision_outcomes:
+                return 0.5
+                
+            # Get recent decisions (last 20)
+            recent_decisions = self.decision_outcomes[-20:] if len(self.decision_outcomes) >= 20 else self.decision_outcomes
+            
+            # Calculate average quality
+            total_quality = sum(d["quality"] for d in recent_decisions)
+            average_quality = total_quality / len(recent_decisions)
+            
+            return average_quality
+            
+        except Exception as e:
+            print(f"Failed to evaluate current performance: {e}")
+            return 0.5
