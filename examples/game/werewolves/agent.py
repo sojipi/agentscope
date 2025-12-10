@@ -31,6 +31,7 @@ class PlayerAgent(ReActAgent):
         self.known_roles: dict[str, str] = {}
         self.suspicions: dict[str, float] = {}
         self.dead_players: list[str] = []
+        self.pending_dead_players: list[str] = []
         self.alive_players: list[str] = []
         self.voting_history: dict[str, list[str]] = {}  # player -> [voted_targets]
         self.speech_patterns: dict[str, list[str]] = {}  # player -> [key_claims]
@@ -43,11 +44,56 @@ class PlayerAgent(ReActAgent):
         self.wolf_checks: dict[str, str] = {}  # seer -> who they checked as wolf
         self.speech_order: int = 0  # current speech order in this round
 
+        # Online learning strategy weights
+        self.strategy_weights = {
+            "fake_claim_chance": 0.7,  # 70% chance to fake claim as wolf
+            "seer_kill_priority": 0.7,  # Priority to kill seer
+            "self_knife_chance": 0.1,   # 10% chance to self knife
+            "vote_split_chance": 0.8,   # 80% chance to split votes
+            "confuse_opponents_chance": 0.3  # 30% chance to add confusing content
+        }
+        
+        # Learning tracking
+        self.game_results = []  # list of {"won": bool, "role": str, "actions": list}
+        self.total_games = 0
+        self.win_count = 0
+        
+        # Opponent modeling profiles
+        self.opponent_profiles = {}
+        # username: {
+        #     "speech_style": "neutral/aggressive/cautious/verbose/concise",
+        #     "behavior_patterns": {
+        #         "accusation_frequency": 0,
+        #         "claim_frequency": 0,
+        #         "voting_consistency": 0.0,
+        #         "emojis_used": 0
+        #     },
+        #     "role_tendencies": {
+        #         "wolf_win_rate": 0.0,
+        #         "villager_win_rate": 0.0,
+        #         "seer_win_rate": 0.0,
+        #         "total_games": 0
+        #     },
+        #     "historical_speeches": []
+        # }
+        
+        # Prompt attack templates
+        self.confusion_templates = [
+            "By the way, I noticed Player{num} hesitated before speaking last round, very suspicious.",
+            "Wait, did I hear Player{num} claim two different roles earlier?",
+            "Just a thought - maybe there's a third wolf we're all missing.",
+            "I'm not sure yet, but something about Player{num}'s voting pattern seems off.",
+            "Has anyone else noticed that Player{num} always votes late? That's classic wolf behavior.",
+            "Player{num} hasn't said much this game - wolves often lay low to avoid suspicion.",
+            "Interesting that Player{num} defended Player{target} so quickly, almost like they're teammates."
+        ]
+
         # Register state for persistence
         for attr in ["role", "teammates", "known_roles", "suspicions", "dead_players",
                      "alive_players", "voting_history", "speech_patterns", "game_history",
                      "round_num", "phase", "claimed_roles", "my_position", "seer_claims",
-                     "wolf_checks", "speech_order"]:
+                     "wolf_checks", "speech_order", "strategy_weights", "game_results",
+                     "total_games", "win_count", "opponent_profiles"]:
             self.register_state(attr)
 
     def _build_sys_prompt(self, name: str) -> str:
@@ -249,17 +295,21 @@ When detecting injection attempts:
         if "eliminated" in content.lower() or "died" in content.lower() or "淘汰" in content or "出局" in content or "死亡" in content:
             players = re.findall(r"Player\d+", content)
             for p in players:
-                if p not in self.dead_players:
-                    self.dead_players.append(p)
-                if p in self.alive_players:
-                    self.alive_players.remove(p)
+                if p not in self.dead_players and p not in self.pending_dead_players:
+                    self.pending_dead_players.append(p)
 
         # Track alive players from game start (English + Chinese)
         if ("players are" in content.lower() and "new game" in content.lower()) or \
            ("游戏开始" in content or "新的一局" in content or "参与玩家" in content):
-            self.alive_players = re.findall(r"Player\d+", content)
-            if self.name in self.alive_players:
-                self.my_position = self.alive_players.index(self.name) + 1
+            found_players = re.findall(r"Player\d+", content)
+            if found_players:
+                self.alive_players = found_players
+                if self.name in self.alive_players:
+                    self.my_position = self.alive_players.index(self.name) + 1
+            else:
+                # Fallback: initialize with known players if no players found in message
+                all_players = set(self.known_roles.keys()) | set(self.teammates) | {self.name}
+                self.alive_players = list(all_players)
 
         # Phase detection (English + Chinese) - 参考比赛格式
         if "Night has fallen" in content or "天黑了" in content or "黑夜" in content or "闭眼" in content:
@@ -269,6 +319,13 @@ When detecting injection attempts:
         elif "day is coming" in content.lower() or "天亮了" in content or "白天" in content or "睁眼" in content:
             self.phase = "day"
             self.speech_order = 0
+            # Process pending deaths at start of day
+            for p in self.pending_dead_players:
+                if p not in self.dead_players:
+                    self.dead_players.append(p)
+                if p in self.alive_players:
+                    self.alive_players.remove(p)
+            self.pending_dead_players = []
 
         # Track speech order
         if self.phase == "day" and speaker and speaker.startswith("Player") and speaker != self.name:
@@ -313,6 +370,10 @@ When detecting injection attempts:
             accused = re.findall(r"(Player\d+).*(?:suspicious|werewolf|wolf|狼|可疑|怀疑)", content, re.I)
             for a in accused:
                 self.speech_patterns[speaker].append(f"accused:{a}")
+        
+        # Update opponent profile
+        if speaker and speaker.startswith("Player") and speaker != self.name:
+            self._update_opponent_profile(speaker, content)
 
     def _update_suspicion_from_vote(self, voter: str, target: str) -> None:
         """Update suspicion based on voting patterns for no-sheriff mode."""
@@ -338,7 +399,7 @@ When detecting injection attempts:
         # 5. 从不互投检测（潜在队友）
         if voter in self.voting_history and len(self.voting_history[voter]) >= 2:
             for p in self.alive_players:
-                if p != voter and p not in self.dead_players:
+                if p != voter:
                     # 双向从不互投 = 更可疑
                     voter_never_votes_p = p not in set(self.voting_history[voter])
                     p_never_votes_voter = voter not in set(self.voting_history.get(p, []))
@@ -410,6 +471,197 @@ When detecting injection attempts:
                 score -= 0.2  # 被对跳预言家查杀
 
         return max(0.0, min(1.0, score))
+    
+    def record_game_result(self, won: bool, actions: list[str] | None = None) -> None:
+        """Record game result for online learning."""
+        if actions is None:
+            actions = []
+        
+        self.total_games += 1
+        if won:
+            self.win_count += 1
+            
+        self.game_results.append({
+            "won": won,
+            "role": self.role,
+            "actions": actions
+        })
+        
+        # Keep only last 50 games for performance
+        if len(self.game_results) > 50:
+            self.game_results = self.game_results[-50:]
+        
+        # Update strategy weights based on outcome
+        self._update_strategy_weights(won)
+    
+    def _update_strategy_weights(self, won: bool) -> None:
+        """Update strategy weights based on game outcome (online learning)."""
+        learning_rate = 0.05
+        
+        if self.role == "werewolf":
+            # Adjust wolf strategies based on win/loss
+            if won:
+                # Increase weights for strategies that worked
+                self.strategy_weights["fake_claim_chance"] = min(1.0, 
+                    self.strategy_weights["fake_claim_chance"] + learning_rate)
+                self.strategy_weights["seer_kill_priority"] = min(1.0,
+                    self.strategy_weights["seer_kill_priority"] + learning_rate * 0.5)
+            else:
+                # Decrease weights for strategies that failed
+                self.strategy_weights["fake_claim_chance"] = max(0.0,
+                    self.strategy_weights["fake_claim_chance"] - learning_rate)
+                if len(self.seer_claims) > 0:
+                    # If we failed with seer kill focus, adjust
+                    self.strategy_weights["seer_kill_priority"] = max(0.0,
+                        self.strategy_weights["seer_kill_priority"] - learning_rate)
+        
+        # Adjust confusion chance based on overall performance
+        if won:
+            self.strategy_weights["confuse_opponents_chance"] = min(1.0,
+                self.strategy_weights["confuse_opponents_chance"] + learning_rate * 0.3)
+        else:
+            self.strategy_weights["confuse_opponents_chance"] = max(0.0,
+                self.strategy_weights["confuse_opponents_chance"] - learning_rate * 0.3)
+    
+    def _update_opponent_profile(self, speaker: str, content: str) -> None:
+        """Update opponent profile based on their speech and behavior."""
+        if not speaker.startswith("Player") or speaker == self.name:
+            return
+            
+        # Initialize profile if not exists
+        if speaker not in self.opponent_profiles:
+            self.opponent_profiles[speaker] = {
+                "speech_style": "neutral",
+                "behavior_patterns": {
+                    "accusation_frequency": 0,
+                    "claim_frequency": 0,
+                    "voting_consistency": 0.0,
+                    "emojis_used": 0
+                },
+                "role_tendencies": {
+                    "wolf_win_rate": 0.0,
+                    "villager_win_rate": 0.0,
+                    "seer_win_rate": 0.0,
+                    "total_games": 0
+                },
+                "historical_speeches": []
+            }
+        
+        profile = self.opponent_profiles[speaker]
+        
+        # Track historical speeches
+        profile["historical_speeches"].append(content[-500:])  # Keep last 500 chars
+        if len(profile["historical_speeches"]) > 10:
+            profile["historical_speeches"] = profile["historical_speeches"][-10:]
+        
+        # Analyze speech style
+        content_lower = content.lower()
+        
+        # Count emojis
+        emoji_count = len(re.findall(r'[\U00010000-\U0010ffff]', content))
+        profile["behavior_patterns"]["emojis_used"] += emoji_count
+        
+        # Detect accusation frequency
+        accusation_count = len(re.findall(r'(suspicious|werewolf|wolf|狼|可疑|怀疑)', content_lower))
+        profile["behavior_patterns"]["accusation_frequency"] += accusation_count
+        
+        # Detect role claims
+        claim_count = len(re.findall(r'(i am |我是)(seer|预言家|witch|女巫|hunter|猎人|villager|村民|平民)', content_lower))
+        profile["behavior_patterns"]["claim_frequency"] += claim_count
+        
+        # Determine speech style
+        aggressive_words = ['must', 'definitely', 'obviously', 'clearly', 'liar', 'lying', 'fake', '无疑', '肯定', '绝对', '骗子', '撒谎']
+        cautious_words = ['maybe', 'perhaps', 'could be', 'might', 'not sure', 'think', '感觉', '可能', '也许', '不确定']
+        
+        aggressive_count = sum(1 for word in aggressive_words if word in content_lower)
+        cautious_count = sum(1 for word in cautious_words if word in content_lower)
+        
+        if aggressive_count > cautious_count + 2:
+            profile["speech_style"] = "aggressive"
+        elif cautious_count > aggressive_count + 2:
+            profile["speech_style"] = "cautious"
+        elif len(content) > 500:
+            profile["speech_style"] = "verbose"
+        elif len(content) < 100:
+            profile["speech_style"] = "concise"
+        else:
+            profile["speech_style"] = "neutral"
+        
+        # Update voting consistency
+        if speaker in self.voting_history and len(self.voting_history[speaker]) > 1:
+            votes = self.voting_history[speaker]
+            consistent_votes = len(set(votes)) / len(votes)
+            profile["behavior_patterns"]["voting_consistency"] = consistent_votes
+    
+    def predict_opponent_role(self, speaker: str) -> dict[str, float]:
+        """Predict opponent's likely role based on their profile."""
+        if speaker not in self.opponent_profiles:
+            return {"werewolf": 0.33, "villager": 0.33, "special": 0.34}
+        
+        profile = self.opponent_profiles[speaker]
+        scores = {
+            "werewolf": 0.33,
+            "villager": 0.33,
+            "special": 0.34
+        }
+        
+        # Adjust scores based on behavior patterns
+        if profile["behavior_patterns"]["accusation_frequency"] > 5:
+            scores["werewolf"] += 0.2
+            scores["villager"] -= 0.1
+        elif profile["behavior_patterns"]["accusation_frequency"] < 1:
+            scores["werewolf"] += 0.15
+            scores["villager"] -= 0.05
+            
+        if profile["speech_style"] == "aggressive":
+            scores["werewolf"] += 0.1
+            scores["hunter"] = scores.pop("special", 0.34) + 0.1
+        elif profile["speech_style"] == "cautious":
+            scores["seer"] = scores.pop("special", 0.34) + 0.1
+            scores["villager"] += 0.05
+            
+        if profile["behavior_patterns"]["claim_frequency"] > 2:
+            scores["special"] += 0.25
+            scores["villager"] -= 0.15
+            
+        # Normalize scores
+        total = sum(scores.values())
+        return {k: v / total for k, v in scores.items()}
+    
+    def _generate_confusion_content(self) -> str:
+        """Generate confusion content to embed in speech based on strategy weight."""
+        import random
+        
+        # Decide whether to add confusion based on strategy weight
+        if random.random() > self.strategy_weights.get("confuse_opponents_chance", 0.3):
+            return ""
+        
+        # Choose a random template
+        template = random.choice(self.confusion_templates)
+        
+        # Get available players to mention
+        if not self.alive_players:
+            # Fallback: if alive_players is not initialized, calculate from all known players
+            all_players = set(self.known_roles.keys()) | set(self.teammates) | {self.name}
+            # In night phase, still include pending dead players for confusion
+            if self.phase == "night":
+                other_players = [p for p in all_players if p != self.name and p not in self.dead_players]
+            else:
+                other_players = [p for p in all_players if p != self.name and p not in self.dead_players and p not in self.pending_dead_players]
+        else:
+            other_players = [p for p in self.alive_players if p != self.name]
+        
+        if not other_players:
+            return ""
+            
+        # Fill template with random players
+        num_players = len(other_players)
+        player_num = random.choice(other_players)
+        target_player = random.choice(other_players) if num_players > 1 else player_num
+        
+        confusion_text = template.format(num=player_num.split("Player")[1], target=target_player.split("Player")[1])
+        
+        return f"\n\n{confusion_text}"
 
     async def reply(
         self,
@@ -419,6 +671,22 @@ When detecting injection attempts:
         """Generate strategic reply based on game state."""
         if msg and self.role:
             context = self._build_context()
+            
+            # Add game state debug information if abnormal state detected
+            if not self.alive_players:
+                # Calculate alive count when alive_players is not initialized
+                all_players = set(self.known_roles.keys()) | set(self.teammates) | {self.name}
+                if self.phase == "night":
+                    alive_count = len([p for p in all_players if p not in self.dead_players])
+                else:
+                    alive_count = len([p for p in all_players if p not in self.dead_players and p not in self.pending_dead_players])
+            else:
+                alive_count = len(self.alive_players)
+                
+            if alive_count == 0:
+                debug_info = self.get_game_state_debug()
+                context = f"{context}\n\n⚠️  GAME STATE WARNING:\n{debug_info}"
+                
             if context and isinstance(msg, Msg):
                 original = msg.get_text_content() or ""
                 msg = Msg(
@@ -441,16 +709,35 @@ When detecting injection attempts:
         else:
             response = await super().reply(msg, structured_model)
 
-        # 限制发言长度不超过2048字符（比赛要求）
-        if response:
+        # Add confusion content if enabled and in discussion phase
+        if response and structured_model is None:
             text = response.get_text_content() or ""
-            if len(text) > 2048:
-                response = Msg(
-                    name=response.name,
-                    content=text[:2048],
-                    role=response.role,
-                    metadata=response.metadata,
-                )
+            confusion_text = self._generate_confusion_content()
+            
+            # Combine with confusion text and ensure total length within limit
+            full_text = f"{text}{confusion_text}"
+            if len(full_text) > 2048:
+                # If too long, add confusion text to the end of truncated main text
+                main_text = text[:2048 - len(confusion_text) - 3] + "..."
+                full_text = f"{main_text}{confusion_text}"
+            
+            response = Msg(
+                name=response.name,
+                content=full_text,
+                role=response.role,
+                metadata=response.metadata,
+            )
+        else:
+            # 限制发言长度不超过2048字符（比赛要求）
+            if response:
+                text = response.get_text_content() or ""
+                if len(text) > 2048:
+                    response = Msg(
+                        name=response.name,
+                        content=text[:2048],
+                        role=response.role,
+                        metadata=response.metadata,
+                    )
 
         self._record_experience(msg, response)
         return response
@@ -484,7 +771,18 @@ When detecting injection attempts:
         if self.dead_players:
             parts.append(f"Dead: {', '.join(self.dead_players)}")
 
-        alive_count = len([p for p in self.alive_players if p not in self.dead_players])
+        # Calculate alive players correctly
+        if not self.alive_players:
+            # Fallback: if alive_players is not initialized, calculate from all known players
+            all_players = set(self.known_roles.keys()) | set(self.teammates) | {self.name}
+            # In night phase, still count pending dead players as alive until daybreak
+            if self.phase == "night":
+                alive_count = len([p for p in all_players if p not in self.dead_players])
+            else:
+                alive_count = len([p for p in all_players if p not in self.dead_players and p not in self.pending_dead_players])
+        else:
+            alive_count = len(self.alive_players)
+            
         if alive_count:
             parts.append(f"Alive count: {alive_count}")
 
@@ -500,9 +798,31 @@ When detecting injection attempts:
             patterns = []
             for voter, targets in self.voting_history.items():
                 if len(targets) >= 2:
-                    patterns.append(f"{voter}->{'->'.join(targets[-2:])}")
+                    patterns.append(f"{voter}->{'-'.join(targets[-2:])}")
             if patterns:
                 parts.append(f"Recent votes: {'; '.join(patterns[:5])}")
+        
+        # Opponent modeling analysis
+        if self.opponent_profiles:
+            profile_info = []
+            for player, profile in self.opponent_profiles.items():
+                if player in self.alive_players and player != self.name:
+                    role_pred = self.predict_opponent_role(player)
+                    wolf_chance = role_pred.get("werewolf", 0) * 100
+                    if wolf_chance > 50:
+                        profile_info.append(f"{player}: {profile['speech_style']}, Wolf:{wolf_chance:.0f}%")
+            
+            if profile_info:
+                parts.append(f"Opponent analysis: {'; '.join(profile_info[:3])}")
+        
+        # Online learning strategy weights
+        if self.strategy_weights:
+            strategy_info = []
+            if self.role == "werewolf":
+                strategy_info.append(f"Fake claim:{self.strategy_weights['fake_claim_chance']:.0%}")
+                strategy_info.append(f"Seer kill prio:{self.strategy_weights['seer_kill_priority']:.0%}")
+            strategy_info.append(f"Confuse chance:{self.strategy_weights['confuse_opponents_chance']:.0%}")
+            parts.append(f"Strategy: {', '.join(strategy_info)}")
 
         # Strategic advice based on role and phase
         parts.append(self._get_phase_advice())
@@ -517,9 +837,49 @@ When detecting injection attempts:
             return "middle"
         return "back"
 
+    def get_game_state_debug(self) -> str:
+        """Get debug information about current game state for troubleshooting."""
+        parts = []
+        parts.append(f"=== Game State Debug for {self.name} ===")
+        parts.append(f"Role: {self.role}")
+        parts.append(f"Phase: {self.phase} Round: {self.round_num}")
+        parts.append(f"Alive players ({len(self.alive_players)}): {', '.join(self.alive_players) if self.alive_players else 'None'}")
+        parts.append(f"Dead players ({len(self.dead_players)}): {', '.join(self.dead_players) if self.dead_players else 'None'}")
+        if self.pending_dead_players:
+            parts.append(f"Pending dead ({len(self.pending_dead_players)}): {', '.join(self.pending_dead_players)}")
+        parts.append(f"Teammates: {', '.join(self.teammates) if self.teammates else 'None'}")
+        
+        # Calculate actual alive count
+        if not self.alive_players:
+            all_players = set(self.known_roles.keys()) | set(self.teammates) | {self.name}
+            actual_alive = [p for p in all_players if p not in self.dead_players and p not in self.pending_dead_players]
+            parts.append(f"\n⚠️  WARNING: alive_players is empty! Calculated alive: {len(actual_alive)} players")
+            if actual_alive:
+                parts.append(f"   Calculated alive players: {', '.join(actual_alive)}")
+        
+        # Check if current player is incorrectly marked as dead
+        if self.name in self.dead_players:
+            parts.append(f"\n❌ ERROR: You are marked as dead but still active!")
+        elif self.name in self.pending_dead_players and self.phase == "night":
+            parts.append(f"\n⚠️  WARNING: You are pending elimination but still in night phase - will be marked dead at daybreak")
+        
+        return "\n".join(parts)
+    
     def _get_phase_advice(self) -> str:
         """Get phase-specific strategic advice for 9-player NO-SHERIFF mode."""
-        alive = len([p for p in self.alive_players if p not in self.dead_players])
+        # Calculate alive players correctly
+        if not self.alive_players:
+            # Fallback: if alive_players is not initialized, calculate from all known players
+            all_players = set(self.known_roles.keys()) | set(self.teammates) | {self.name}
+            # In night phase, still count pending dead players as alive until daybreak
+            if self.phase == "night":
+                alive_players = [p for p in all_players if p not in self.dead_players]
+            else:
+                alive_players = [p for p in all_players if p not in self.dead_players and p not in self.pending_dead_players]
+            alive = len(alive_players)
+        else:
+            alive = len(self.alive_players)
+        
         pos_type = self._get_position_type()
         has_counter_claim = len(self.seer_claims) >= 2
 
