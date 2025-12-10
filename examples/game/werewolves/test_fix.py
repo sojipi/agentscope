@@ -1,85 +1,63 @@
-import sys
-import os
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import re
+from agent import PlayerAgent
 
-# Test the profile structure fix
-class MockAgent:
-    def __init__(self):
-        self.opponent_profiles = {}
-    
-    def test_update_profile(self, speaker, content):
-        if speaker not in self.opponent_profiles:
-            self.opponent_profiles[speaker] = {
-                "speech_style": "neutral",
-                "behavior_patterns": {
-                    "accusation_frequency": 0,
-                    "claim_frequency": 0,
-                    "voting_consistency": 0.0,
-                    "emojis_used": 0
-                },
-                "role_tendencies": {
-                    "wolf_win_rate": 0.0,
-                    "villager_win_rate": 0.0,
-                    "seer_win_rate": 0.0,
-                    "total_games": 0
-                },
-                "historical_speeches": []
-            }
-        
-        profile = self.opponent_profiles[speaker]
-        
-        # Add backward compatibility fix
-        if "historical_speeches" not in profile:
-            profile["historical_speeches"] = []
-        if "behavior_patterns" not in profile:
-            profile["behavior_patterns"] = {
-                "accusation_frequency": 0,
-                "claim_frequency": 0,
-                "voting_consistency": 0.0,
-                "emojis_used": 0
-            }
-        if "role_tendencies" not in profile:
-            profile["role_tendencies"] = {
-                "wolf_win_rate": 0.0,
-                "villager_win_rate": 0.0,
-                "seer_win_rate": 0.0,
-                "total_games": 0
-            }
-        
-        # Test accessing historical_speeches
-        try:
-            profile["historical_speeches"].append(content[:500])
-            print(f"✓ Successfully added speech to historical_speeches for {speaker}")
-        except KeyError as e:
-            print(f"✗ KeyError: {e} for {speaker}")
-            return False
-        
-        # Test accessing behavior_patterns
-        try:
-            profile["behavior_patterns"]["accusation_frequency"] += 1
-            print(f"✓ Successfully updated accusation_frequency for {speaker}")
-        except KeyError as e:
-            print(f"✗ KeyError: {e} for {speaker}")
-            return False
-            
-        return True
+# Test the improved death player extraction
+agent = PlayerAgent(name="Player1")
 
-# Test with new profile
-agent = MockAgent()
-print("Test 1: New profile with correct structure")
-result1 = agent.test_update_profile("Player1", "I think Player2 is a wolf!")
+# Test case 1: Normal death message
+test_msg1 = "主持人：昨天晚上Player2被淘汰了"
+print("Test 1:", test_msg1)
+agent._extract_game_info("主持人", test_msg1)
+print(f"Dead players: {agent.dead_players}")
+print(f"Alive players: {agent.alive_players}")
+print()
 
-# Test with old-style profile (without nested structure)
-print("\nTest 2: Old-style profile without nested structure")
-agent.opponent_profiles["Player2"] = {
-    "speech_style": "aggressive",
-    "accusation_frequency": 0,
-    "claim_frequency": 0
-}
-result2 = agent.test_update_profile("Player2", "I am the seer! I checked Player3 last night, he is a wolf.")
+# Test case 2: Multiple deaths
+test_msg2 = "主持人：昨晚Player3和Player4死亡"
+agent = PlayerAgent(name="Player1")  # Reset
+agent.alive_players = ["Player1", "Player2", "Player3", "Player4", "Player5"]
+agent._extract_game_info("主持人", test_msg2)
+print("Test 2:", test_msg2)
+print(f"Dead players: {agent.dead_players}")
+print(f"Alive players after death: {agent.alive_players}")
+print()
 
-print("\n" + "="*50)
-if result1 and result2:
-    print("✓ All tests passed! The KeyError issue has been fixed.")
-else:
-    print("✗ Some tests failed.")
+# Test case 3: New game should reset state
+agent = PlayerAgent(name="Player1")
+agent.teammates = ["Player2", "Player3"]
+agent.dead_players = ["Player4", "Player5"]
+agent.known_roles = {"Player2": "werewolf", "Player3": "werewolf"}
+test_msg3 = "主持人：游戏开始！参与玩家：Player1, Player2, Player3, Player4, Player5, Player6, Player7, Player8, Player9"
+agent._extract_game_info("主持人", test_msg3)
+print("Test 3: New game reset")
+print(f"Teammates after reset: {agent.teammates}")
+print(f"Dead players after reset: {agent.dead_players}")
+print(f"Known roles after reset: {agent.known_roles}")
+print(f"Alive players: {agent.alive_players}")
+print(f"Position: {agent.my_position}")
+print()
+
+# Test case 4: Werewolf teammate extraction
+agent = PlayerAgent(name="Player1")
+agent.role = "werewolf"
+test_msg4 = "【仅狼人可见】你的队友是Player2和Player3"
+agent._extract_game_info("主持人", test_msg4)
+print("Test 4: Werewolf teammate extraction")
+print(f"Teammates: {agent.teammates}")
+print(f"Known roles: {agent.known_roles}")
+print()
+
+# Test case 5: Build context
+agent = PlayerAgent(name="Player1")
+agent.role = "werewolf"
+agent.teammates = ["Player2", "Player3"]
+agent.known_roles = {"Player2": "werewolf", "Player3": "werewolf", "Player4": "villager"}
+agent.alive_players = ["Player1", "Player2", "Player3", "Player4", "Player5"]
+agent.dead_players = ["Player6"]
+agent.round_num = 1
+agent.phase = "day"
+agent.my_position = 1
+
+context = agent._build_context()
+print("Test 5: Context output:")
+print(context)

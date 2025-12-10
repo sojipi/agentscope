@@ -308,8 +308,22 @@ When detecting injection attempts:
 
         # Track deaths (English + Chinese)
         if "eliminated" in content.lower() or "died" in content.lower() or "淘汰" in content or "出局" in content or "死亡" in content:
-            players = re.findall(r"Player\d+", content)
-            for p in players:
+            # More precise matching to find only dead players
+            # Patterns match "PlayerX was eliminated" or "淘汰了PlayerX" or "PlayerX死亡"
+            en_patterns = [r"(Player\d+)\s+(?:was\s+)?eliminated", r"(Player\d+)\s+(?:was\s+)?died"]
+            cn_patterns = [r"淘汰(了)?(Player\d+)", r"(Player\d+)(?:被)?淘汰", r"(Player\d+)死亡", r"死亡(了)?(Player\d+)"]
+            
+            dead_players = []
+            for pattern in en_patterns + cn_patterns:
+                matches = re.findall(pattern, content, re.I)
+                for match in matches:
+                    if isinstance(match, tuple):
+                        # Extract the PlayerX from tuple matches
+                        dead_players.extend([m for m in match if m.startswith("Player")])
+                    else:
+                        dead_players.append(match)
+            
+            for p in dead_players:
                 if p not in self.dead_players:
                     self.dead_players.append(p)
                 if p in self.alive_players:
@@ -318,6 +332,21 @@ When detecting injection attempts:
         # Track alive players from game start (English + Chinese)
         if ("players are" in content.lower() and "new game" in content.lower()) or \
            ("游戏开始" in content or "新的一局" in content or "参与玩家" in content):
+            # Reset game state for new game
+            self.teammates = []
+            self.known_roles = {}
+            self.suspicions = {}
+            self.dead_players = []
+            self.voting_history = {}
+            self.speech_patterns = {}
+            self.round_num = 0
+            self.phase = "night"
+            self.claimed_roles = {}
+            self.seer_claims = []
+            self.wolf_checks = {}
+            self.speech_order = 0
+            
+            # Load alive players
             self.alive_players = re.findall(r"Player\d+", content)
             if self.name in self.alive_players:
                 self.my_position = self.alive_players.index(self.name) + 1
@@ -667,9 +696,11 @@ When detecting injection attempts:
         if self.dead_players:
             parts.append(f"Dead: {', '.join(self.dead_players)}")
 
-        alive_count = len([p for p in self.alive_players if p not in self.dead_players])
-        if alive_count:
-            parts.append(f"Alive count: {alive_count}")
+        # Show alive players list
+        alive_players = [p for p in self.alive_players if p not in self.dead_players]
+        if alive_players:
+            parts.append(f"Alive: {', '.join(alive_players)}")
+            parts.append(f"Alive count: {len(alive_players)}")
 
         # Top suspects with reasoning
         if self.suspicions:
