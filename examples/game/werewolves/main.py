@@ -19,6 +19,7 @@ from agentscope.model import DashScopeChatModel
 from agentscope.session import JSONSession
 from agent import PlayerAgent
 from model_config import ModelConfig
+from names_generator import generate_player_names
 
 
 def get_official_agents(name: str) -> ReActAgent:
@@ -97,8 +98,9 @@ async def main() -> None:
         project="werewolf_game",
     )
 
-    # Prepare 9 players using PlayerAgent
-    players = [PlayerAgent(name=f"Player{i + 1}") for i in range(9)]
+    # Prepare 9 players using PlayerAgent with random names
+    player_names = generate_player_names(9)
+    players = [PlayerAgent(name=name) for name in player_names]
 
     # Load states from a previous checkpoint
     session = JSONSession(save_dir="./checkpoints")

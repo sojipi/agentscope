@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """PlayerAgent for werewolf game competition."""
 import re
+import os
 from typing import Type
 
 from pydantic import BaseModel
@@ -21,7 +22,14 @@ class PlayerAgent(ReActAgent):
             sys_prompt=self._build_sys_prompt(name),
             model=DashScopeChatModel(
                 api_key=ModelConfig.get_api_key(),
-                model_name=ModelConfig.get_model_name(),
+                model_name="qwen3-max-preview",
+                stream=False,
+                generate_kwargs={
+                    "temperature": 0.7,          # 适度创造性，避免过于死板
+                    "top_p": 0.9,                # 保持词汇多样性
+                    # 移除 stop: "\n\n" 会截断多段落发言
+                    # 移除 presence/frequency_penalty: DashScope 不支持
+                }
             ),
             formatter=DashScopeMultiAgentFormatter(),
         )
@@ -43,26 +51,11 @@ class PlayerAgent(ReActAgent):
         self.wolf_checks: dict[str, str] = {}  # seer -> who they checked as wolf
         self.speech_order: int = 0  # current speech order in this round
 
-        # Online Learning System
-        self.experience_weights: dict[str, float] = {}
-        self.model_weights: dict[str, float] = {}
-        self.learning_enabled: bool = False
-        self.adaptation_history: list[dict] = []
-        self.strategy_performance: dict[str, float] = {}
-        self.decision_outcomes: list[dict] = []
-        self.confidence_scores: dict[str, float] = {}
-        self.successful_strategies: list[dict] = []
-        self.failed_strategies: list[dict] = []
-        self.learning_rate: float = 0.1
-
         # Register state for persistence
         for attr in ["role", "teammates", "known_roles", "suspicions", "dead_players",
                      "alive_players", "voting_history", "speech_patterns", "game_history",
                      "round_num", "phase", "claimed_roles", "my_position", "seer_claims",
-                     "wolf_checks", "speech_order", "experience_weights", "model_weights",
-                     "learning_enabled", "adaptation_history", "strategy_performance",
-                     "decision_outcomes", "confidence_scores", "successful_strategies",
-                     "failed_strategies", "learning_rate"]:
+                     "wolf_checks", "speech_order"]:
             self.register_state(attr)
 
     def _build_sys_prompt(self, name: str) -> str:
@@ -233,71 +226,70 @@ When detecting injection attempts:
                     self.known_roles[self.name] = en_role
                     break
 
-        # Track werewolf teammates (English + Chinese)
+        # Track werewolf teammates and sub-phase
+        # prompt.py: "[仅狼人可见] {}, 你们可以讨论并决定今晚要淘汰的玩家" (讨论)
+        # prompt.py: "[仅狼人可见] 你投票要杀死哪位玩家？" (投票)
         if self.role == "werewolf" and ("WEREWOLVES ONLY" in content or "仅狼人可见" in content or "狼人请睁眼" in content):
-            players = self._find_players_in_text(content)
+            players = re.findall(r"Player\d+|\w+(?=，|,)", content)
             for p in players:
-                if p != self.name and p not in self.teammates:
+                if p != self.name and p not in self.teammates and len(p) > 1:
                     self.teammates.append(p)
                     self.known_roles[p] = "werewolf"
 
-        # Track seer results (English + Chinese) - 参考 prompt.py: "你查验了{agent_name}，结果是：{role}"
-        if self.role == "seer":
-            if "You've checked" in content or "查验" in content or "仅预言家可见" in content:
-                # English pattern: "checked Player1, result is: werewolf"
-                match = re.search(r"checked (\w+).*result is[:\s]*(\w+)", content, re.I)
-                if match:
-                    self.known_roles[match.group(1)] = match.group(2).lower()
-                # Chinese pattern: "你查验了Player1，结果是：狼人/村民"
-                players = self._find_players_in_text(content)
-                if players:
-                    # 查找查验结果模式
-                    if "查验了" in content and ("结果是" in content or "是" in content):
-                        for player in players:
-                            if player in content and ("狼" in content or "村民" in content or "好人" in content):
-                                role_result = "werewolf" if "狼" in content else "villager"
-                                self.known_roles[player] = role_result
-                                break
-                # Fallback: "Player1是狼人/好人"
-                if players:
-                    for player in players:
-                        if player in content and ("狼人" in content or "好人" in content or "平民" in content or "村民" in content):
-                            role_result = "werewolf" if "狼人" in content else "villager"
-                            self.known_roles[player] = role_result
-                            break
+        # Track seer results - 必须包含"结果是"才是真正的查验结果
+        # prompt.py: "[仅预言家可见] 你查验了{agent_name}，结果是：{role}。"
+        # 注意：不能匹配"你要查谁"这种选择阶段的消息
+        if self.role == "seer" and ("result is" in content.lower() or "结果是" in content):
+            # English pattern: "You've checked Player1, and the result is: werewolf"
+            match = re.search(r"checked (\w+).*result is[:\s]*(\w+)", content, re.I)
+            if match:
+                self.known_roles[match.group(1)] = match.group(2).lower()
+            # Chinese pattern: "你查验了XXX，结果是：狼人/好人"
+            match_cn = re.search(r"查验了(\w+)，结果是[：:]\s*(\w+)", content)
+            if match_cn:
+                role_str = match_cn.group(2)
+                role_result = "werewolf" if "狼" in role_str else "villager"
+                self.known_roles[match_cn.group(1)] = role_result
 
-        # Track deaths (English + Chinese)
-        if "eliminated" in content.lower() or "died" in content.lower() or "淘汰" in content or "出局" in content or "死亡" in content:
-            players = self._find_players_in_text(content)
+        # Track deaths
+        # prompt.py: "天亮了，请所有玩家睁眼。昨晚被淘汰的玩家有：{}。"
+        # prompt.py: "{}, 你已被淘汰。"
+        if "eliminated" in content.lower() or "died" in content.lower() or "被淘汰" in content or "出局" in content:
+            players = re.findall(r"Player\d+", content)
             for p in players:
                 if p not in self.dead_players:
                     self.dead_players.append(p)
                 if p in self.alive_players:
                     self.alive_players.remove(p)
 
-        # Track alive players from game start (English + Chinese)
+        # Track alive players from game start
+        # prompt.py: "新的一局游戏开始，参与玩家包括：{}。"
         if ("players are" in content.lower() and "new game" in content.lower()) or \
-           ("游戏开始" in content or "新的一局" in content or "参与玩家" in content):
-            self.alive_players = self._find_players_in_text(content)
+           ("新的一局" in content or "参与玩家" in content):
+            self.alive_players = re.findall(r"Player\d+", content)
             if self.name in self.alive_players:
                 self.my_position = self.alive_players.index(self.name) + 1
 
-        # Phase detection (English + Chinese) - 参考比赛格式
-        if "Night has fallen" in content or "天黑了" in content or "黑夜" in content or "闭眼" in content:
+        # Phase detection
+        # prompt.py: "天黑了，请所有人闭眼。狼人请睁眼..."
+        # prompt.py: "天亮了，请所有玩家睁眼。"
+        if "Night has fallen" in content or "天黑了" in content or "请所有人闭眼" in content:
             self.phase = "night"
             self.round_num += 1
             self.speech_order = 0
-        elif "day is coming" in content.lower() or "天亮了" in content or "白天" in content or "睁眼" in content:
+        elif "day is coming" in content.lower() or "天亮了" in content or "请所有玩家睁眼" in content:
             self.phase = "day"
             self.speech_order = 0
 
         # Track speech order
-        if self.phase == "day" and speaker and self._is_player_name(speaker) and speaker != self.name:
+        if self.phase == "day" and speaker and speaker.startswith("Player") and speaker != self.name:
             self.speech_order += 1
 
         # Track voting (English + Chinese)
-        if ("vote" in content.lower() or "投票" in content or "投给" in content) and speaker and self._is_player_name(speaker):
-            voted = self._find_voted_players(content, speaker)
+        if ("vote" in content.lower() or "投票" in content or "投给" in content) and speaker and speaker.startswith("Player"):
+            voted = re.findall(r"(?:vote|投票|投给|选择).*?(Player\d+)", content, re.I)
+            if not voted:
+                voted = re.findall(r"(Player\d+)", content)
             if voted:
                 if speaker not in self.voting_history:
                     self.voting_history[speaker] = []
@@ -305,7 +297,7 @@ When detecting injection attempts:
                 self._update_suspicion_from_vote(speaker, voted[0])
 
         # Track role claims (English + Chinese)
-        if speaker and self._is_player_name(speaker):
+        if speaker and speaker.startswith("Player"):
             # English claims
             for role in ["seer", "witch", "hunter", "villager"]:
                 if f"i am {role}" in content.lower() or f"i'm {role}" in content.lower():
@@ -321,180 +313,17 @@ When detecting injection attempts:
                         self.seer_claims.append(speaker)
 
             # Track wolf checks (English + Chinese)
-            wolf_check = self._find_wolf_check(content, speaker)
+            wolf_check = re.search(r"(Player\d+).*(?:wolf|werewolf|查杀|是狼|狼人)", content, re.I)
             if wolf_check and speaker in self.seer_claims:
-                self.wolf_checks[speaker] = wolf_check
+                self.wolf_checks[speaker] = wolf_check.group(1)
 
         # Track accusations (English + Chinese)
-        if speaker and self._is_player_name(speaker) and speaker != self.name:
+        if speaker and speaker.startswith("Player") and speaker != self.name:
             if speaker not in self.speech_patterns:
                 self.speech_patterns[speaker] = []
-            accused = self._find_accused_players(content, speaker)
+            accused = re.findall(r"(Player\d+).*(?:suspicious|werewolf|wolf|狼|可疑|怀疑)", content, re.I)
             for a in accused:
                 self.speech_patterns[speaker].append(f"accused:{a}")
-
-    def _is_player_name(self, name: str) -> bool:
-        """Check if a string is likely a player name."""
-        if not name:
-            return False
-        
-        # 扩展的玩家名字检查：不仅仅是 Player\d+ 格式
-        # 检查是否是合理的玩家标识符（字母、数字、下划线、中文等）
-        import re
-        
-        # 排除明显的非玩家标识符
-        excluded_words = {
-            'moderator', '系统', 'system', 'game', 'night', 'day', '玩家', '投票', 'vote', 
-            '发言', '开始', '结束', '查验', '结果', '角色', '预言家', '女巫', '猎人', '村民',
-            '狼人', 'werewolf', 'seer', 'witch', 'hunter', 'villager', 'check', 'result',
-            '淘汰', '死亡', '出局', '存活', 'eliminated', 'died', 'alive', 'dead'
-        }
-        
-        if name.lower() in excluded_words:
-            return False
-        
-        # 匹配可能的玩家名字：各种格式
-        player_patterns = [
-            r'^Player\d+$',  # Player1, Player2等
-            r'^[A-Za-z][A-Za-z0-9_]*$',  # 英文标识符
-            r'^[\u4e00-\u9fa5]+$',  # 纯中文
-            r'^[A-Za-z][\u4e00-\u9fa5]*$',  # 英文+中文混合
-            r'^[A-Za-z0-9_-]+$',  # 包含数字、下划线、连字符
-        ]
-        
-        return any(re.match(pattern, name) for pattern in player_patterns)
-
-    def _find_players_in_text(self, text: str) -> list[str]:
-        """Find all player names in text."""
-        import re
-        if not text:
-            return []
-        
-        players = set()
-        
-        # 1. 查找标准格式 Player\d+
-        players.update(re.findall(r'Player\d+', text))
-        
-        # 2. 查找带冒号的玩家发言格式：Player1: 发言内容, Alice: 发言内容
-        colon_pattern = r'(\w+)\s*:\s*[^\n\r]*'
-        colon_matches = re.findall(colon_pattern, text)
-        players.update(colon_matches)
-        
-        # 3. 查找逗号分隔的玩家名列表：Alice, Bob, 小红, 小明
-        # 使用更精确的模式，避免误匹配
-        comma_patterns = [
-            r'[,:：]\s*([A-Za-z][A-Za-z0-9_-]*|[一-龥]{2,4})\s*[,，、]',  # 分隔符后的玩家名
-            r'([A-Za-z][A-Za-z0-9_-]*|[一-龥]{2,4})\s*[,，、]\s*(?:and|&|和)\s*[A-Za-z]|[一-龥]',  # 和/and连接的情况
-            r'([A-Za-z][A-Za-z0-9_-]*|[一-龥]{2,4})\s*[,，、]\s*$',  # 列表末尾
-            r'^\s*([A-Za-z][A-Za-z0-9_-]*|[一-龥]{2,4})\s*[,，、]'  # 列表开头
-        ]
-        for pattern in comma_patterns:
-            matches = re.findall(pattern, text)
-            players.update(matches)
-        
-        # 4. 查找独立出现的玩家名（前面有动词或介词的情况）
-        # 使用更精确的模式，避免误匹配
-        action_patterns = [
-            r'(?:投票|投给|支持|觉得|认为|查验|查杀|怀疑|指控)\s+([A-Za-z][A-Za-z0-9_-]*|[一-龥]{2,4})(?!\w)',  # 后面不能跟字母数字
-            r'(?:是狼|像狼|可能是狼|是好人|是村民)\s+([A-Za-z][A-Za-z0-9_-]*|[一-龥]{2,4})(?!\w)',  # 后面不能跟字母数字
-            r'([A-Za-z][A-Za-z0-9_-]*|[一-龥]{2,4})\s*(?:很?\s?可疑|像狼人|是狼)(?!\w)',  # 前后都不能跟字母数字
-        ]
-        for pattern in action_patterns:
-            matches = re.findall(pattern, text)
-            players.update(matches)
-        
-        # 5. 特别处理"说X可能"这种模式，提取玩家名
-        say_pattern = r'(?:说|觉得|认为)\s*([A-Za-z][A-Za-z0-9_-]*|[一-龥]{2,4})(?=\s*可能|是|像)'
-        say_matches = re.findall(say_pattern, text)
-        players.update(say_matches)
-        
-        # 6. 过滤掉明显不是玩家名字的词
-        filtered_players = []
-        for p in players:
-            if self._is_player_name(p) and len(p) <= 20 and len(p) >= 2:
-                filtered_players.append(p)
-        
-        # 去重并返回
-        return list(set(filtered_players))
-
-    def _find_voted_players(self, content: str, speaker: str) -> list[str]:
-        """Find voted players from content."""
-        import re
-        if not content:
-            return []
-        
-        # 查找投票目标
-        players = self._find_players_in_text(content)
-        voted_players = []
-        
-        # 查找投票相关模式
-        vote_patterns = [
-            r'(?:vote|投票|投给|选择).*?(\w+)',
-            r'投.*?(\w+)',
-            r'支持.*?(\w+)',
-        ]
-        
-        for pattern in vote_patterns:
-            matches = re.findall(pattern, content, re.I)
-            for match in matches:
-                if match in players and match != speaker:
-                    voted_players.append(match)
-        
-        # 如果没有找到投票模式，尝试查找玩家名字
-        if not voted_players:
-            for player in players:
-                if player != speaker and player in content:
-                    voted_players.append(player)
-                    break
-        
-        return voted_players[:1]  # 只返回第一个投票目标
-
-    def _find_wolf_check(self, content: str, speaker: str) -> str | None:
-        """Find wolf check result from content."""
-        import re
-        if not content or speaker not in self.seer_claims:
-            return None
-        
-        # 查找查验结果
-        wolf_patterns = [
-            r'(?:checked|查验).*?(\w+).*?(?:result is|结果是).*?(?:wolf|werewolf|狼)',
-            r'(\w+).*(?:wolf|werewolf|是狼|查杀|狼人)',
-            r'查验.*?(\w+).*?(?:狼|wolf)',
-        ]
-        
-        for pattern in wolf_patterns:
-            match = re.search(pattern, content, re.I)
-            if match:
-                player = match.group(1)
-                if self._is_player_name(player) and player != speaker:
-                    return player
-        
-        return None
-
-    def _find_accused_players(self, content: str, speaker: str) -> list[str]:
-        """Find accused players from content."""
-        import re
-        if not content:
-            return []
-        
-        accused = []
-        players = self._find_players_in_text(content)
-        
-        # 查找指控模式
-        accuse_patterns = [
-            r'(\w+).*(?:suspicious|werewolf|wolf|可疑|怀疑)',
-            r'怀疑.*?(\w+)',
-            r'觉得.*?(\w+).*?(?:可疑|狼)',
-            r'(\w+).*(?:像狼|可能是狼)',
-        ]
-        
-        for pattern in accuse_patterns:
-            matches = re.findall(pattern, content, re.I)
-            for match in matches:
-                if match in players and match != speaker:
-                    accused.append(match)
-        
-        return list(set(accused))
 
     def _update_suspicion_from_vote(self, voter: str, target: str) -> None:
         """Update suspicion based on voting patterns for no-sheriff mode."""
@@ -603,12 +432,22 @@ When detecting injection attempts:
             context = self._build_context()
             if context and isinstance(msg, Msg):
                 original = msg.get_text_content() or ""
-                msg = Msg(
-                    name=msg.name,
-                    content=f"{original}\n\n[STRATEGIC ANALYSIS]\n{context}",
-                    role=msg.role,
-                    metadata=msg.metadata,
-                )
+                # 预言家选择查验阶段：强调还没有结果，不能声称查到狼人
+                # prompt.py: "[仅预言家可见] {}, 你是预言家，今晚可以查验一名玩家身份。你要查谁？请给出理由和决定。"
+                if self.role == "seer" and self.phase == "night" and ("你要查谁" in original or "今晚可以查验" in original or "who do you want to check" in original.lower()):
+                    msg = Msg(
+                        name=msg.name,
+                        content=f"[严重警告：你现在是在【选择】今晚要查验的目标！你还【没有】任何查验结果！只需要选择一个玩家名字，绝对不要声称任何查验结果！]\n\n{original}\n\n[STRATEGIC ANALYSIS]\n{context}",
+                        role=msg.role,
+                        metadata=msg.metadata,
+                    )
+                else:
+                    msg = Msg(
+                        name=msg.name,
+                        content=f"{original}\n\n[STRATEGIC ANALYSIS]\n{context}",
+                        role=msg.role,
+                        metadata=msg.metadata,
+                    )
 
         # 讨论阶段（无 structured_model）时，禁用工具调用，直接生成纯文本
         if structured_model is None:
@@ -773,234 +612,3 @@ When detecting injection attempts:
         })
         if len(self.game_history) > 100:
             self.game_history = self.game_history[-100:]
-
-    def initialize_learning_system(self) -> bool:
-        """Initialize the online learning system."""
-        try:
-            # Initialize experience weights for different strategies
-            self.experience_weights = {
-                "voting_accuracy": 0.5,
-                "role_claiming_success": 0.5,
-                "wolf_detection_rate": 0.5,
-                "teammate_protection": 0.5,
-                "position_advantage": 0.5,
-                "seer_credibility": 0.5,
-                "witch_utility": 0.5,
-                "hunter_effectiveness": 0.5,
-            }
-            
-            # Initialize model weights for adaptive learning
-            self.model_weights = {
-                "recent_performance": 0.3,
-                "historical_success": 0.2,
-                "opponent_modeling": 0.2,
-                "position_context": 0.15,
-                "phase_specific": 0.15,
-            }
-            
-            # Initialize strategy performance tracking
-            self.strategy_performance = {
-                "aggressive_voting": 0.0,
-                "conservative_playing": 0.0,
-                "early_claiming": 0.0,
-                "delayed_reveal": 0.0,
-                "team_coordination": 0.0,
-            }
-            
-            # Enable learning system
-            self.learning_enabled = True
-            
-            return True
-            
-        except Exception as e:
-            print(f"Failed to initialize learning system: {e}")
-            return False
-
-    def update_strategy_weights(self, strategy: str, performance: float) -> bool:
-        """Update strategy weights based on performance."""
-        try:
-            if not self.learning_enabled:
-                return False
-                
-            if strategy not in self.strategy_performance:
-                return False
-                
-            # Update strategy performance with learning rate
-            current_performance = self.strategy_performance[strategy]
-            updated_performance = current_performance + self.learning_rate * (performance - current_performance)
-            self.strategy_performance[strategy] = max(0.0, min(1.0, updated_performance))
-            
-            # Update related experience weights
-            if "voting" in strategy:
-                self.experience_weights["voting_accuracy"] = updated_performance
-            elif "claiming" in strategy:
-                self.experience_weights["role_claiming_success"] = updated_performance
-            elif "detection" in strategy:
-                self.experience_weights["wolf_detection_rate"] = updated_performance
-                
-            # Record adaptation
-            self.adaptation_history.append({
-                "strategy": strategy,
-                "old_performance": current_performance,
-                "new_performance": updated_performance,
-                "round": self.round_num,
-                "phase": self.phase,
-                "role": self.role,
-            })
-            
-            # Keep only recent adaptations
-            if len(self.adaptation_history) > 50:
-                self.adaptation_history = self.adaptation_history[-50:]
-                
-            return True
-            
-        except Exception as e:
-            print(f"Failed to update strategy weights: {e}")
-            return False
-
-    def get_adaptive_strategy_advice(self) -> str:
-        """Get adaptive strategy advice based on learning."""
-        try:
-            if not self.learning_enabled:
-                return ""
-                
-            # Analyze current game state
-            current_performance = self._evaluate_current_performance()
-            pos_type = self._get_position_type()
-            
-            # Generate adaptive advice based on learned patterns
-            if self.role == "werewolf":
-                if self.phase == "night":
-                    # Night strategy based on learned performance
-                    if self.strategy_performance.get("aggressive_voting", 0.5) > 0.6:
-                        return "Learned: Aggressive night kills have high success rate. Target most vocal seer claimer."
-                    else:
-                        return "Learned: Conservative approach better. Focus on protecting teammates."
-                else:
-                    # Day strategy based on position and learning
-                    if pos_type == "back" and self.strategy_performance.get("position_advantage", 0.5) > 0.7:
-                        return "Learned: Back position control is effective. Use final speech to influence votes."
-                    else:
-                        return "Learned: Spread influence across team. Avoid obvious coordination."
-                        
-            elif self.role == "seer":
-                if self.strategy_performance.get("early_claiming", 0.5) > 0.6:
-                    return "Learned: Early claiming with detail builds credibility. Be specific about check reasoning."
-                else:
-                    return "Learned: Consider timing carefully. Build case before revealing role."
-                    
-            elif self.role == "witch":
-                if self.strategy_performance.get("conservative_playing", 0.5) > 0.6:
-                    return "Learned: Conservative potion usage preserves options. Save for critical moments."
-                else:
-                    return "Learned: More proactive potion usage can control game flow."
-                    
-            elif self.role == "hunter":
-                if self.strategy_performance.get("hunter_effectiveness", 0.5) > 0.6:
-                    return "Learned: Patient shot timing works well. Wait for clear wolf identification."
-                else:
-                    return "Learned: Earlier shot decisions prevent losing opportunities."
-                    
-            else:  # villager
-                if self.strategy_performance.get("team_coordination", 0.5) > 0.6:
-                    return "Learned: Strong coordination with villagers leads to victory. Focus on building consensus."
-                else:
-                    return "Learned: Individual analysis sometimes better. Trust your own judgment more."
-                    
-        except Exception as e:
-            print(f"Failed to get adaptive strategy advice: {e}")
-            return ""
-
-    def evaluate_decision_quality(self, decision: str, outcome: str) -> float:
-        """Evaluate the quality of a decision based on outcome."""
-        try:
-            if not self.learning_enabled:
-                return 0.5
-                
-            # Base quality assessment
-            quality = 0.5
-            
-            # Evaluate based on decision type and outcome
-            if "vote" in decision.lower():
-                if outcome == "correct_wolf_eliminated":
-                    quality = 0.9
-                elif outcome == "innocent_eliminated":
-                    quality = 0.1
-                elif outcome == "wolf_missed":
-                    quality = 0.3
-                else:
-                    quality = 0.5
-                    
-            elif "claim" in decision.lower():
-                if outcome == "claim_believed":
-                    quality = 0.8
-                elif outcome == "claim_rejected":
-                    quality = 0.2
-                else:
-                    quality = 0.5
-                    
-            elif "night_action" in decision.lower():
-                if outcome == "action_successful":
-                    quality = 0.8
-                elif outcome == "action_failed":
-                    quality = 0.2
-                else:
-                    quality = 0.5
-                    
-            # Consider role-specific outcomes
-            if self.role == "seer" and "check" in decision.lower():
-                if outcome == "wolf_found":
-                    quality = 0.9
-                elif outcome == "villager_found":
-                    quality = 0.6
-                else:
-                    quality = 0.3
-                    
-            # Store decision outcome for learning
-            self.decision_outcomes.append({
-                "decision": decision[:100],  # Truncate for storage
-                "outcome": outcome,
-                "quality": quality,
-                "round": self.round_num,
-                "phase": self.phase,
-                "role": self.role,
-            })
-            
-            # Keep only recent decisions
-            if len(self.decision_outcomes) > 100:
-                self.decision_outcomes = self.decision_outcomes[-100:]
-                
-            # Update confidence scores
-            outcome_key = str(outcome)  # Convert to string to avoid hash issues
-            if outcome_key not in self.confidence_scores:
-                self.confidence_scores[outcome_key] = quality
-            else:
-                # Update with moving average
-                current_confidence = self.confidence_scores[outcome_key]
-                updated_confidence = 0.8 * current_confidence + 0.2 * quality
-                self.confidence_scores[outcome_key] = updated_confidence
-                
-            return quality
-            
-        except Exception as e:
-            print(f"Failed to evaluate decision quality: {e}")
-            return 0.5
-
-    def _evaluate_current_performance(self) -> float:
-        """Evaluate current game performance."""
-        try:
-            if not self.decision_outcomes:
-                return 0.5
-                
-            # Get recent decisions (last 20)
-            recent_decisions = self.decision_outcomes[-20:] if len(self.decision_outcomes) >= 20 else self.decision_outcomes
-            
-            # Calculate average quality
-            total_quality = sum(d["quality"] for d in recent_decisions)
-            average_quality = total_quality / len(recent_decisions)
-            
-            return average_quality
-            
-        except Exception as e:
-            print(f"Failed to evaluate current performance: {e}")
-            return 0.5
