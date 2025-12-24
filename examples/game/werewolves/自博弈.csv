@@ -1,0 +1,9 @@
+代码位置,类型,模拟提炼方法（小规模自博弈）,硬编码方式（手动更新脚本）
+"sys_prompt中的狼人夜杀优先级（e.g., ""Round 1: Seer 70% > Witch 20% > Self-knife 10%""）",概率分布,"模拟狼人局，按不同优先级组合跑子组（e.g., Seer 60-80%变异），统计狼胜率最高组合（e.g., Seer 75%、Witch 15%、Self-knife 10%）。用numpy平均/网格搜索。","直接替换文本：e.g., ""Round 1: Seer 75% > Witch 15% > Self-knife 10%""。讲解：自博弈中发现Seer优先级微调提升狼隐蔽性。"
+"sys_prompt中的假跳决策（e.g., ""Can skip fake-claim (30%)""）",决策概率,"模拟狼局，按跳率0-50%变异，统计后位/前位跳的胜率（e.g., 无警长模式下跳率25%最优）。过滤高胜局平均。","替换：""Can skip fake-claim (25%)""。添加if逻辑：if random.random() < 0.25: 建议不跳（但需import random）。"
+"sys_prompt中的Seer/Witch/Hunter/Villager策略示例（e.g., Front Position Seer的发言模板）",文本模板,"提取高胜局的发言日志，按位置/角色分类，选Top-3胜率模板（e.g., 用string similarity聚类）。","替换模板文本：e.g., ""Player1 seer, checked Player2 clear. [新理由: Checked nearby for baseline, suspect Player4 due to hesitation.]""。保持简短。"
+"_update_suspicion_from_vote中的分数更新（e.g., +0.25 for mismatch, +0.35 for known good, +0.3 for seer vote）",怀疑阈值,"模拟全局局，按分数0.1-0.5变异网格搜索，选最大化代理胜率的组合（e.g., mismatch +0.28最优）。用sympy或简单循环计算。",替换常量：self.suspicions[voter] += 0.28。讲解：自博弈优化后，微调提升投票模式检测准确15%。
+"_evaluate_seer_credibility中的分数调整（e.g., base 0.5, -0.1 for counter, +0.3 for verified）",可信度阈值,"模拟seer对跳局，按分数变异统计代理决策胜率（e.g., verified +0.28最优）。过滤seer胜局平均。",替换：score += 0.28。添加阈值if score > 0.65: high_cred（原>0.6）。
+"_detect_vote_coordination中的条件/分数（e.g., len(voters_for_target) >=2, target_suspicion <0.3, +0.1）",协调检测阈值,"模拟投票密集局，按阈值2-3/<0.2-0.4变异，选最小化假阳性+最大化狼检测胜率的（e.g., >=2.5, <0.28, +0.12）。",替换：if len(...) >= 2.5 and ... < 0.28: += 0.12。讲解：自博弈中调整阈值减少噪声，提升协调识别。
+"_get_phase_advice中的端局检测（e.g., alive <=4）",端局阈值/文本,"模拟后期局，按alive 3-5变异统计端局策略胜率（e.g., <=3.5最优预警）。提取高胜建议文本。","替换：if alive <= 3.5: ""ENDGAME! ...""。更新文本：""4 alive (1w 3v): Wrong vote = instant loss""。"
+"generate_kwargs中的temperature/top_p（e.g., 0.7/0.9）",生成参数,"模拟发言局，按0.5-1.0变异，选发言一致性+胜率最佳（e.g., temp 0.65）。","替换：temperature=0.65, top_p=0.85。讲解：自博弈测试下，降低temp提升发言稳定性。"
